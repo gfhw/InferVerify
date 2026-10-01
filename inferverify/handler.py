@@ -1,106 +1,168 @@
-"""Kopf handlers: react to the InferenceCheck CR lifecycle.
+"""Kopf handlers: create the verification Job and watch it to completion.
 
-The operator watches ``InferenceCheck`` objects. On create it:
+Flow:
 
-  1. marks the check Pending;
-  2. runs the requested Robot suites synchronously (in a thread pool, so the
-     kopf event loop is not blocked);
-  3. aggregates the listener results into Verified / Degraded;
-  4. writes the outcome back to ``status``.
+  1. ``on.create`` builds a Kubernetes Job (robot image running
+     ``inferverify.job_runner``) and marks the check Pending.
+  2. ``on.timer`` polls the Job every 10s; once the Job finishes, it reads the
+     result JSON from the Job pod's stdout and writes Verified / Degraded /
+     Unknown back to the check's status.
 
-Execution model note: the first version runs Robot **in-process** rather than
-spawning a Job, because inference verification is a lightweight HTTP probe
-(no GPU needed). The runner is isolated behind ``runner.run_suites`` so a
-Job-based executor can be swapped in later without touching the handler.
+The robot work runs inside the Job pod, isolated from the operator process.
 """
 
+import json
+import os
+
 import kopf
+import kubernetes.client as k8s
+import kubernetes.config
 
-from .result import build_result
-from .runner import run_suites
-
-# Where the Robot suites live inside the container image.
 SUITE_ROOT = "/app/tests"
+JOB_IMAGE = os.environ.get("INFERVERIFY_IMAGE", "inferverify:latest")
+RESULT_PREFIX = "INFERVERIFY_RESULT:"
+POLL_INTERVAL = 10.0
+JOB_TIMEOUT_SECONDS = 300
+
+# Lazily initialized API clients: loading kube config has side effects (reads
+# the in-cluster token or ~/.kube/config), so we defer it until a handler
+# actually runs, keeping the module importable in unit tests.
+_batch_api = None
+_core_api = None
+
+
+def _load_config():
+    try:
+        kubernetes.config.load_incluster_config()
+    except kubernetes.config.ConfigException:
+        kubernetes.config.load_kube_config()
+
+
+def _get_batch_api():
+    global _batch_api
+    if _batch_api is None:
+        _load_config()
+        _batch_api = k8s.BatchV1Api()
+    return _batch_api
+
+
+def _get_core_api():
+    global _core_api
+    if _core_api is None:
+        _load_config()
+        _core_api = k8s.CoreV1Api()
+    return _core_api
+
+
+def _job_name(check_name):
+    return f"{check_name}-verify"
 
 
 def _suite_paths(suites):
-    """Map suite names (e.g. "smoke") to .robot file paths."""
-    paths = []
-    for name in suites:
-        path = f"{SUITE_ROOT}/{name}.robot"
-        paths.append(path)
-    return paths
+    suites = suites or ["smoke"]
+    return [f"{SUITE_ROOT}/{name}.robot" for name in suites]
 
 
-def _robot_variables(spec):
-    """Build Robot --variable entries from the CR spec.
+def _build_job(name, namespace, suites, target, thresholds):
+    env = [
+        k8s.V1EnvVar(name="SUITES", value=",".join(_suite_paths(suites))),
+        k8s.V1EnvVar(name="TARGET", value=target or ""),
+        k8s.V1EnvVar(name="THRESHOLDS_JSON", value=json.dumps(thresholds or {})),
+        k8s.V1EnvVar(name="REPORT_DIR", value="/tmp/reports"),
+    ]
+    container = k8s.V1Container(
+        name="robot",
+        image=JOB_IMAGE,
+        image_pull_policy="IfNotPresent",
+        command=["python", "-m", "inferverify.job_runner"],
+        env=env,
+    )
+    template = k8s.V1PodTemplateSpec(
+        metadata=k8s.V1ObjectMeta(labels={"app": "inferverify-job", "check": name}),
+        spec=k8s.V1PodSpec(restart_policy="Never", containers=[container]),
+    )
+    spec = k8s.V1JobSpec(
+        template=template,
+        backoff_limit=0,
+        active_deadline_seconds=JOB_TIMEOUT_SECONDS,
+    )
+    return k8s.V1Job(
+        api_version="batch/v1",
+        kind="Job",
+        metadata=k8s.V1ObjectMeta(name=_job_name(name), namespace=namespace),
+        spec=spec,
+    )
 
-    The inference target and every threshold become variables, e.g.
-    thresholds.ttftP99Ms -> TTFT_P99_MS=5000.
-    """
-    variables = []
 
-    target = spec.get("target", "")
-    if target:
-        variables.append(f"TARGET:{target}")
-
-    thresholds = spec.get("thresholds") or {}
-    for key, value in thresholds.items():
-        # camelCase -> UPPER_SNAKE_CASE
-        name = "".join(
-            "_" + c.lower() if c.isupper() else c for c in key
-        ).lstrip("_").upper()
-        variables.append(f"{name}:{value}")
-
-    return variables
+def _read_result(core_api, name, namespace):
+    """Read the result JSON from the Job pod's stdout."""
+    pods = core_api.list_namespaced_pod(
+        namespace=namespace, label_selector=f"check={name}"
+    )
+    for pod in pods.items:
+        try:
+            logs = core_api.read_namespaced_pod_log(
+                name=pod.metadata.name, namespace=namespace
+            )
+        except k8s.ApiException:
+            continue
+        for line in logs.splitlines():
+            if line.startswith(RESULT_PREFIX):
+                return json.loads(line[len(RESULT_PREFIX):])
+    return None
 
 
 @kopf.on.create("verification.inferguard.io/v1alpha1", "inferencechecks")
 def create_check(spec, patch, name, namespace, logger, **_):
     release_ref = spec.get("releaseRef", "")
     revision = spec.get("revision", 0)
-    suites = spec.get("suites") or ["smoke"]
-
     logger.info(
-        "InferenceCheck %s/%s: verifying release=%s revision=%s",
+        "InferenceCheck %s/%s: creating verification job (release=%s rev=%s)",
         namespace, name, release_ref, revision,
     )
 
     patch.status["phase"] = "Pending"
-    patch.status["message"] = "running robot verification"
+    patch.status["message"] = "verification job created"
 
-    variables = _robot_variables(spec)
-    suite_paths = _suite_paths(suites)
+    job = _build_job(
+        name, namespace,
+        spec.get("suites"),
+        spec.get("target"),
+        spec.get("thresholds"),
+    )
+    _get_batch_api().create_namespaced_job(namespace=namespace, body=job)
 
-    logger.info("Running suites: %s with variables: %s", suites, variables)
 
+@kopf.timer(
+    "verification.inferguard.io/v1alpha1", "inferencechecks",
+    interval=POLL_INTERVAL,
+)
+def watch_job(status, patch, name, namespace, logger, **_):
+    phase = (status or {}).get("phase", "")
+    if phase in ("Verified", "Degraded", "Unknown"):
+        return  # already settled, stop polling
+
+    batch_api = _get_batch_api()
     try:
-        rc, listener = run_suites(
-            suite_paths,
-            variables,
-            report_dir=f"/tmp/reports/{namespace}-{name}",
-            on_progress=lambda *args: logger.info("progress: %s", args),
-        )
-    except Exception as exc:  # noqa: BLE001 - surface as Unknown, don't crash
-        logger.error("Verification raised: %s", exc)
-        patch.status["phase"] = "Unknown"
-        patch.status["message"] = str(exc)
+        job = batch_api.read_namespaced_job(name=_job_name(name), namespace=namespace)
+    except k8s.ApiException as exc:
+        if exc.status == 404:
+            return  # job not created yet
+        raise
+
+    # Not finished: still running (or waiting for a node).
+    if job.status.succeeded is None and job.status.failed is None:
         return
 
-    result = build_result(listener)
-    patch.status.update(result)
-    patch.status["reportURL"] = f"/tmp/reports/{namespace}-{name}/report.html"
+    result = _read_result(_get_core_api(), name, namespace)
+    if result is None:
+        patch.status["phase"] = "Unknown"
+        patch.status["message"] = "job finished but result could not be parsed"
+        return
 
-    if result["phase"] == "Verified":
-        logger.info("Verification PASSED for release=%s revision=%s", release_ref, revision)
-        patch.status["message"] = f"verified revision {revision}"
-    else:
-        failed = result["failedCases"]
-        logger.warning(
-            "Verification DEGRADED for release=%s revision=%s: %s",
-            release_ref, revision, failed,
-        )
-        patch.status["message"] = (
-            f"{len(failed)} case(s) failed: "
-            + "; ".join(c["name"] for c in failed)
-        )
+    # Drop the internal return code before writing back.
+    result.pop("returnCode", None)
+    patch.status.update(result)
+    logger.info(
+        "InferenceCheck %s/%s settled: %s", namespace, name, result.get("phase")
+    )

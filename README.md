@@ -19,13 +19,17 @@ InferVerify 用 Robot Framework 的**定量断言**回答这个问题:跑用例�
 ## 架构
 
 ```
-InferenceCheck CR ──► kopf handler
-                        ├─ robot.run() 跑用例(listener 收集结果)
-                        ├─ 阈值通过 --variable 注入(声明式,不改用例)
+InferenceCheck CR ──► kopf on.create
+                        ├─ 创建 Kubernetes Job(robot 镜像跑 inferverify.job_runner)
+                        ├─ 阈值/target 通过环境变量注入(声明式,不改用例)
+                        └─ status.phase = Pending
+
+kopf timer(每 10s)──► watch Job
+                        ├─ Job 完成 → 读 Pod stdout 里的结果 JSON
                         └─ 回写 status: Verified / Degraded / Unknown
 ```
 
-**执行模型**:第一版在 operator 进程内**同步**跑 Robot(验证是轻量 HTTP 探测,不需要 GPU)。`runner.run_suites` 是隔离点,后续可无缝换成 Job-based executor(起 Job 跑、收集 output.xml)。
+**执行模型**:robot 用例跑在**独立的 Job Pod**里(与 operator 进程隔离)。Job 容器执行 `inferverify.job_runner`,把结果以单行 JSON(`INFERVERIFY_RESULT:...`)打到 stdout;operator 通过 timer 轮询 Job 状态,完成后读日志回写 CR。
 
 ---
 
@@ -124,14 +128,15 @@ kubectl get inferencecheck llama-3-8b-check -o yaml
 
 ```
 InferVerify/
-├── operator/
+├── inferverify/
 │   ├── main.py        # kopf 入口
-│   ├── handler.py     # CR handler(状态机 + 触发验证)
-│   ├── runner.py      # robot.run 封装(执行器隔离点)
+│   ├── handler.py     # 创建 Job + timer 轮询回写状态
+│   ├── job_runner.py  # Job 容器入口(跑 robot + 输出结果 JSON)
 │   ├── listener.py    # Robot listener(进度 + 结果收集)
 │   └── result.py      # 结果聚合(Verified/Degraded)
 ├── tests/
-│   └── smoke.robot    # 示例用例(健康检查 + 模型加载)
+│   ├── smoke.robot    # 示例用例(健康检查 + 模型加载)
+│   └── test_*.py      # 单元测试
 ├── deploy/
 │   ├── crd.yaml
 │   ├── rbac.yaml
