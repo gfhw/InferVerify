@@ -21,6 +21,7 @@ import kubernetes.config
 SUITE_ROOT = "/app/tests"
 JOB_IMAGE = os.environ.get("INFERVERIFY_IMAGE", "inferverify:latest")
 RESULT_PREFIX = "INFERVERIFY_RESULT:"
+PROGRESS_PREFIX = "INFERVERIFY_PROGRESS:"
 POLL_INTERVAL = 10.0
 JOB_TIMEOUT_SECONDS = 300
 
@@ -94,8 +95,8 @@ def _build_job(name, namespace, suites, target, thresholds):
     )
 
 
-def _read_result(core_api, name, namespace):
-    """Read the result JSON from the Job pod's stdout."""
+def _read_logs(core_api, name, namespace):
+    """Return the Job pod's stdout lines (empty if none readable yet)."""
     pods = core_api.list_namespaced_pod(
         namespace=namespace, label_selector=f"check={name}"
     )
@@ -106,10 +107,25 @@ def _read_result(core_api, name, namespace):
             )
         except k8s.ApiException:
             continue
-        for line in logs.splitlines():
-            if line.startswith(RESULT_PREFIX):
-                return json.loads(line[len(RESULT_PREFIX):])
+        return logs.splitlines()
+    return []
+
+
+def _read_result(core_api, name, namespace):
+    """Read the result JSON line from the Job pod's stdout."""
+    for line in _read_logs(core_api, name, namespace):
+        if line.startswith(RESULT_PREFIX):
+            return json.loads(line[len(RESULT_PREFIX):])
     return None
+
+
+def _read_latest_progress(core_api, name, namespace):
+    """Read the latest progress JSON line from the Job pod's stdout."""
+    latest = None
+    for line in _read_logs(core_api, name, namespace):
+        if line.startswith(PROGRESS_PREFIX):
+            latest = json.loads(line[len(PROGRESS_PREFIX):])
+    return latest
 
 
 @kopf.on.create("verification.inferguard.io/v1alpha1", "inferencechecks")
@@ -150,8 +166,11 @@ def watch_job(status, patch, name, namespace, logger, **_):
             return  # job not created yet
         raise
 
-    # Not finished: still running (or waiting for a node).
+    # Not finished: still running (or waiting for a node). Surface live progress.
     if job.status.succeeded is None and job.status.failed is None:
+        progress = _read_latest_progress(_get_core_api(), name, namespace)
+        if progress:
+            patch.status["progress"] = progress
         return
 
     result = _read_result(_get_core_api(), name, namespace)

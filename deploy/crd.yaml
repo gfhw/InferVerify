@@ -61,6 +61,10 @@ spec:
                   items:
                     type: object
                     x-kubernetes-preserve-unknown-fields: true
+                progress:
+                  type: object
+                  description: Live execution progress (event/test/status)
+                  x-kubernetes-preserve-unknown-fields: true
                 reportURL:
                   type: string
                 message:

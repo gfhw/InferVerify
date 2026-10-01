@@ -17,6 +17,19 @@ from robot import run
 from inferverify.listener import ProgressListener
 from inferverify.result import build_result
 
+PROGRESS_PREFIX = "INFERVERIFY_PROGRESS:"
+RESULT_PREFIX = "INFERVERIFY_RESULT:"
+
+
+def _print_progress(*args):
+    """Emit a progress event line for the operator to stream out of the logs."""
+    event = {"event": args[0]}
+    if len(args) > 1:
+        event["test"] = args[1]
+    if len(args) > 2:
+        event["status"] = args[2]
+    print(PROGRESS_PREFIX + json.dumps(event), flush=True)
+
 
 def _env_list(name):
     raw = os.environ.get(name, "")
@@ -46,13 +59,14 @@ def main():
     suites = _env_list("SUITES") or ["/app/tests/smoke.robot"]
     report_dir = os.environ.get("REPORT_DIR", "/tmp/reports")
 
-    listener = ProgressListener()
+    listener = ProgressListener(on_progress=_print_progress)
 
     rc = run(
         *suites,
         outputdir=report_dir,
         listener=listener,
         variable=_robot_variables(),
+        pythonpath=[os.path.dirname(os.path.dirname(os.path.abspath(__file__)))],
         console=None,
         log="log.html",
         report="report.html",
@@ -61,7 +75,7 @@ def main():
 
     result = build_result(listener)
     result["returnCode"] = rc
-    print("INFERVERIFY_RESULT:" + json.dumps(result), flush=True)
+    print(RESULT_PREFIX + json.dumps(result), flush=True)
 
     sys.exit(0 if rc == 0 else 1)
 

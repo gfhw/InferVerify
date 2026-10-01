@@ -85,13 +85,15 @@ InferVerify(Python)  watch InferenceCheck
 
 ## 相对 kubetest 的定制能力
 
-[kubetest](https://kubetest.readthedocs.io/) 是通用 K8s 测试框架(pytest),它的结果是 pass/fail。InferVerify 定制的点:
+[kubetest](https://kubetest.readthedocs.io/) 是通用 K8s 测试框架(pytest),它的结果就是 pytest 的 pass/fail、跑在 CI/本地、不回写任何资源。InferVerify 定制的点(均已实现):
 
-1. **声明式阈值** —— 阈值在 CR 里,改 CR 不改用例;
-2. **结构化结果** —— `failedCases` 带 expected/actual,而非布尔;
-3. **版本化验证** —— `releaseRef` + `revision` 关联部署版本,升级回归;
-4. **实时进度** —— Robot listener(关键字级事件)驱动;
-5. **AI 关键字库** —— 后续迭代:`Verify TTFT Below` 等推理专用关键字。
+1. **声明式阈值** —— 阈值在 CR 里(`spec.thresholds`),作为变量注入用例,改 CR 不改用例;
+2. **结构化结果** —— `failedCases` 带 `expected`/`actual`(从关键字失败信息解析),而非布尔;
+3. **版本化验证** —— `releaseRef` + `revision` 关联部署版本,升级回归对比;
+4. **实时进度** —— Job 容器通过 listener 把关键字级事件打到 stdout,operator 轮询回写 `status.progress`;
+5. **AI 关键字库** —— `Verify TTFT Below`、`Verify KV Cache Below`、`Inference Service Ready` 等推理专用关键字,写一个 CR 就能用。
+
+> 待做(进阶):流程级暂停/人工介入——验证分阶段,阶段间暂停等批准。
 
 ---
 
