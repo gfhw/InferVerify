@@ -243,7 +243,62 @@ def approval_changed(old, new, name, namespace, logger, **_):
         return
 
     result.pop("returnCode", None)
-    result["phase"] = "Verified"
+
+    # Only a passing verification can be approved. If the verification actually
+    # degraded, flipping approved=true must not overwrite the real outcome.
+    if result.get("phase") != "Verified":
+        logger.warning(
+            "InferenceCheck %s/%s approval ignored: result is %s",
+            namespace, name, result.get("phase"),
+        )
+        return
+
     result["message"] = "approved"
     _patch_status(name, namespace, result)
     logger.info("InferenceCheck %s/%s approved", namespace, name)
+
+
+@kopf.timer(
+    "verification.inferguard.io/v1alpha1", "inferencechecks",
+    interval=30.0,
+)
+def timeout_guard(status, name, namespace, logger, **_):
+    """Fallback for Jobs that die without writing a result.
+
+    A Job that times out (activeDeadlineSeconds) or crashes before the
+    job_runner publishes the result would otherwise leave the check stuck in
+    Pending forever, because the ConfigMap watch only reacts to a ``result``
+    field. Here we detect a failed Job with no result and settle it as Unknown.
+    """
+    phase = (status or {}).get("phase", "")
+    if phase in ("Verified", "Degraded", "PendingApproval", "Unknown"):
+        return  # already settled
+
+    batch_api = _get_batch_api()
+    try:
+        job = batch_api.read_namespaced_job(name=_job_name(name), namespace=namespace)
+    except k8s.ApiException as exc:
+        if exc.status == 404:
+            return
+        raise
+
+    # Job failed (non-zero exit or deadline exceeded) but wrote no result.
+    failed = job.status.failed or 0
+    if failed == 0:
+        return
+
+    core_api = _get_core_api()
+    try:
+        cm = core_api.read_namespaced_config_map(_result_cm_name(name), namespace)
+    except k8s.ApiException:
+        return
+    if (cm.data or {}).get("result"):
+        return  # result actually made it in; let the watch handle it
+
+    _patch_status(name, namespace, {
+        "phase": "Unknown",
+        "message": "verification job failed without producing a result",
+    })
+    logger.warning(
+        "InferenceCheck %s/%s job failed with no result; marked Unknown", namespace, name
+    )
