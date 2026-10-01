@@ -14,6 +14,9 @@ Flow:
 
 import json
 import os
+import re
+import time
+from datetime import datetime, timezone
 
 import kopf
 import kubernetes.client as k8s
@@ -73,7 +76,7 @@ def _suite_paths(suites):
     return [f"{SUITE_ROOT}/{name}.robot" for name in suites]
 
 
-def _build_job(name, namespace, suites, target, thresholds):
+def _build_job(name, namespace, suites, target, thresholds, job_name=None):
     env = [
         k8s.V1EnvVar(name="SUITES", value=",".join(_suite_paths(suites))),
         k8s.V1EnvVar(name="TARGET", value=target or ""),
@@ -101,7 +104,10 @@ def _build_job(name, namespace, suites, target, thresholds):
     return k8s.V1Job(
         api_version="batch/v1",
         kind="Job",
-        metadata=k8s.V1ObjectMeta(name=_job_name(name), namespace=namespace),
+        metadata=k8s.V1ObjectMeta(
+            name=job_name or _job_name(name),
+            namespace=namespace,
+        ),
         spec=spec,
     )
 
@@ -302,3 +308,70 @@ def timeout_guard(status, name, namespace, logger, **_):
     logger.warning(
         "InferenceCheck %s/%s job failed with no result; marked Unknown", namespace, name
     )
+
+
+_INTERVAL_RE = re.compile(r"(\d+)([hms])")
+
+
+def _parse_interval(raw):
+    """Parse "6h", "30m", "1h30m" into seconds. Returns 0 when unparseable."""
+    if not raw:
+        return 0
+    total = 0
+    for match in _INTERVAL_RE.finditer(str(raw)):
+        value = int(match.group(1))
+        unit = match.group(2)
+        if unit == "h":
+            total += value * 3600
+        elif unit == "m":
+            total += value * 60
+        elif unit == "s":
+            total += value
+    return total
+
+
+def _now_rfc3339():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_rfc3339(raw):
+    if not raw:
+        return None
+    try:
+        dt = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+@kopf.timer(
+    "verification.inferguard.io/v1alpha1", "inferencechecks",
+    interval=60.0,
+)
+def schedule_recheck(spec, status, name, namespace, logger, **_):
+    """Runtime assurance: periodically re-run verification while the release runs.
+
+    Only active when ``spec.interval`` is set (e.g. "6h"). The timer fires every
+    60s but skips until ``interval`` has elapsed since the last check, then
+    creates a fresh verification Job (timestamped name). The result overwrites
+    the same ConfigMap, and the existing watch reflects it into status.
+    """
+    interval_seconds = _parse_interval(spec.get("interval"))
+    if interval_seconds <= 0:
+        return  # runtime assurance disabled
+
+    now = time.time()
+    last_ts = _parse_rfc3339((status or {}).get("lastCheckAt"))
+    if last_ts and (now - last_ts) < interval_seconds:
+        return  # not due yet
+
+    job = _build_job(
+        name, namespace,
+        spec.get("suites"),
+        spec.get("target"),
+        spec.get("thresholds"),
+        job_name=f"{_job_name(name)}-{int(now)}",
+    )
+    _get_batch_api().create_namespaced_job(namespace=namespace, body=job)
+    _patch_status(name, namespace, {"lastCheckAt": _now_rfc3339()})
+    logger.info("InferenceCheck %s/%s recheck job created", namespace, name)

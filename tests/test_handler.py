@@ -1,6 +1,6 @@
-"""Tests for handler helpers (_suite_paths, _should_await_approval)."""
+"""Tests for handler helpers (_suite_paths, _should_await_approval, _parse_interval)."""
 
-from inferverify.handler import _should_await_approval, _suite_paths
+from inferverify.handler import _parse_interval, _should_await_approval, _suite_paths
 
 
 def test_suite_paths():
@@ -28,3 +28,22 @@ def test_should_await_approval_required_and_approved():
 def test_should_await_approval_not_required():
     assert _should_await_approval({"approval": {"required": False}}) is False
     assert _should_await_approval({}) is False
+
+
+def test_parse_interval_hours():
+    assert _parse_interval("6h") == 21600
+
+
+def test_parse_interval_minutes():
+    assert _parse_interval("30m") == 1800
+
+
+def test_parse_interval_compound():
+    assert _parse_interval("1h30m") == 5400
+
+
+def test_parse_interval_empty_or_invalid():
+    assert _parse_interval("") == 0
+    assert _parse_interval(None) == 0
+    assert _parse_interval("abc") == 0
+

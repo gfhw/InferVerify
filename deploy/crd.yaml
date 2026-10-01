@@ -58,12 +58,22 @@ spec:
                     approved:
                       type: boolean
                       description: User sets true to approve
+                interval:
+                  type: string
+                  description: >-
+                    Runtime assurance interval (e.g. "6h", "30m"). When set, the
+                    operator periodically re-runs verification while the release
+                    runs. Empty = verify once after deploy.
             status:
               type: object
               properties:
                 phase:
                   type: string
                   description: Pending | Verified | Degraded | Unknown
+                lastCheckAt:
+                  type: string
+                  format: date-time
+                  description: When the last verification run started
                 passedCases:
                   type: integer
                 failedCases:
