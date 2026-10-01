@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inferverify
+  namespace: inferverify-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: inferverify
+rules:
+  - apiGroups: ["verification.inferguard.io"]
+    resources: ["inferencechecks"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["verification.inferguard.io"]
+    resources: ["inferencechecks/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: inferverify
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: inferverify
+subjects:
+  - kind: ServiceAccount
+    name: inferverify
+    namespace: inferverify-system

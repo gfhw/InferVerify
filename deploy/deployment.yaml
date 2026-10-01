@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inferverify-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inferverify
+  namespace: inferverify-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inferverify
+  template:
+    metadata:
+      labels:
+        app: inferverify
+    spec:
+      serviceAccountName: inferverify
+      containers:
+        - name: operator
+          image: inferverify:latest
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
