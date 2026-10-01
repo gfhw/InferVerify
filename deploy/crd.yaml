@@ -22,14 +22,13 @@ spec:
           properties:
             spec:
               type: object
-              description: Desired inference verification
+              description: Desired verification check (generic Robot check, optionally tied to an inference release)
               required:
-                - releaseRef
                 - target
               properties:
                 releaseRef:
                   type: string
-                  description: The ModelRelease this check verifies
+                  description: Optional ModelRelease this check verifies (enables InferGuard linkage)
                 revision:
                   type: integer
                   description: Helm revision being verified
@@ -38,7 +37,7 @@ spec:
                   description: Inference engine (vllm/tgi/sglang)
                 target:
                   type: string
-                  description: Inference service URL, e.g. http://llama-3-8b:8000
+                  description: Service URL to verify, e.g. http://my-service:8080
                 suites:
                   type: array
                   description: Robot suites to run (empty = smoke)
