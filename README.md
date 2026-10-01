@@ -20,16 +20,21 @@ InferVerify 用 Robot Framework 的**定量断言**回答这个问题:跑用例�
 
 ```
 InferenceCheck CR ──► kopf on.create
-                        ├─ 创建 Kubernetes Job(robot 镜像跑 inferverify.job_runner)
+                        ├─ 创建结果 ConfigMap + Kubernetes Job(robot 镜像跑 job_runner)
                         ├─ 阈值/target 通过环境变量注入(声明式,不改用例)
                         └─ status.phase = Pending
 
-kopf timer(每 10s)──► watch Job
-                        ├─ Job 完成 → 读 Pod stdout 里的结果 JSON
-                        └─ 回写 status: Verified / Degraded / Unknown
+Job 容器 ──► 写 ConfigMap
+              ├─ progress 字段(每个用例开始/结束,实时)
+              └─ result 字段(验证结束,结构化)
+
+kopf on.event(watch ConfigMap)──► 实时回写 status
+              ├─ progress → status.progress(流式,无轮询)
+              ├─ result → status.phase: Verified / Degraded / Unknown
+              └─ approval.required 且通过 → PendingApproval(等人工批准)
 ```
 
-**执行模型**:robot 用例跑在**独立的 Job Pod**里(与 operator 进程隔离)。Job 容器执行 `inferverify.job_runner`,把结果以单行 JSON(`INFERVERIFY_RESULT:...`)打到 stdout;operator 通过 timer 轮询 Job 状态,完成后读日志回写 CR。
+**执行模型**:robot 用例跑在**独立的 Job Pod**里。Job 容器把进度和结果写到结果 ConfigMap;operator 通过 `on.event` **watch ConfigMap 变化**实时回写 CR(不是轮询)。`spec.approval.required` 时,通过的人工验证会停在 `PendingApproval`,用户把 `spec.approval.approved` 置 true 才最终 `Verified`。
 
 ---
 

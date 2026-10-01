@@ -1,14 +1,15 @@
-"""Kopf handlers: create the verification Job and watch it to completion.
+"""Kopf handlers: orchestrate the verification Job and reflect its outcome.
 
 Flow:
 
-  1. ``on.create`` builds a Kubernetes Job (robot image running
-     ``inferverify.job_runner``) and marks the check Pending.
-  2. ``on.timer`` polls the Job every 10s; once the Job finishes, it reads the
-     result JSON from the Job pod's stdout and writes Verified / Degraded /
-     Unknown back to the check's status.
-
-The robot work runs inside the Job pod, isolated from the operator process.
+  1. ``on.create`` creates an empty result ConfigMap and the verification Job
+     (robot image running ``inferverify.job_runner``), then marks Pending.
+  2. The Job publishes progress and the final result into that ConfigMap.
+  3. ``on.event`` watches those ConfigMaps and streams progress/result back into
+     the InferenceCheck status — no polling, near-realtime.
+  4. If ``spec.approval.required`` is set and verification passed, the phase
+     becomes ``PendingApproval`` until the user flips ``spec.approval.approved``,
+     handled by ``on.field``.
 """
 
 import json
@@ -20,16 +21,12 @@ import kubernetes.config
 
 SUITE_ROOT = "/app/tests"
 JOB_IMAGE = os.environ.get("INFERVERIFY_IMAGE", "inferverify:latest")
-RESULT_PREFIX = "INFERVERIFY_RESULT:"
-PROGRESS_PREFIX = "INFERVERIFY_PROGRESS:"
-POLL_INTERVAL = 10.0
+RESULT_CM_LABEL = {"app": "inferverify-result"}
 JOB_TIMEOUT_SECONDS = 300
 
-# Lazily initialized API clients: loading kube config has side effects (reads
-# the in-cluster token or ~/.kube/config), so we defer it until a handler
-# actually runs, keeping the module importable in unit tests.
 _batch_api = None
 _core_api = None
+_custom_api = None
 
 
 def _load_config():
@@ -55,8 +52,20 @@ def _get_core_api():
     return _core_api
 
 
+def _get_custom_api():
+    global _custom_api
+    if _custom_api is None:
+        _load_config()
+        _custom_api = k8s.CustomObjectsApi()
+    return _custom_api
+
+
 def _job_name(check_name):
     return f"{check_name}-verify"
+
+
+def _result_cm_name(check_name):
+    return f"{check_name}-result"
 
 
 def _suite_paths(suites):
@@ -70,6 +79,8 @@ def _build_job(name, namespace, suites, target, thresholds):
         k8s.V1EnvVar(name="TARGET", value=target or ""),
         k8s.V1EnvVar(name="THRESHOLDS_JSON", value=json.dumps(thresholds or {})),
         k8s.V1EnvVar(name="REPORT_DIR", value="/tmp/reports"),
+        k8s.V1EnvVar(name="RESULT_CONFIGMAP", value=_result_cm_name(name)),
+        k8s.V1EnvVar(name="RESULT_NAMESPACE", value=namespace),
     ]
     container = k8s.V1Container(
         name="robot",
@@ -95,37 +106,39 @@ def _build_job(name, namespace, suites, target, thresholds):
     )
 
 
-def _read_logs(core_api, name, namespace):
-    """Return the Job pod's stdout lines (empty if none readable yet)."""
-    pods = core_api.list_namespaced_pod(
-        namespace=namespace, label_selector=f"check={name}"
-    )
-    for pod in pods.items:
-        try:
-            logs = core_api.read_namespaced_pod_log(
-                name=pod.metadata.name, namespace=namespace
+def _ensure_result_cm(name, namespace):
+    """Create the empty result ConfigMap (idempotent)."""
+    core_api = _get_core_api()
+    try:
+        core_api.read_namespaced_config_map(_result_cm_name(name), namespace)
+    except k8s.ApiException as exc:
+        if exc.status == 404:
+            body = k8s.V1ConfigMap(
+                metadata=k8s.V1ObjectMeta(
+                    name=_result_cm_name(name),
+                    namespace=namespace,
+                    labels={"app": "inferverify-result", "check": name},
+                ),
+                data={},
             )
-        except k8s.ApiException:
-            continue
-        return logs.splitlines()
-    return []
+            core_api.create_namespaced_config_map(namespace, body)
 
 
-def _read_result(core_api, name, namespace):
-    """Read the result JSON line from the Job pod's stdout."""
-    for line in _read_logs(core_api, name, namespace):
-        if line.startswith(RESULT_PREFIX):
-            return json.loads(line[len(RESULT_PREFIX):])
-    return None
+def _patch_status(name, namespace, status_update):
+    """Merge-patch the InferenceCheck status subresource."""
+    _get_custom_api().patch_namespaced_custom_object_status(
+        group="verification.inferguard.io",
+        version="v1alpha1",
+        namespace=namespace,
+        plural="inferencechecks",
+        name=name,
+        body={"status": status_update},
+    )
 
 
-def _read_latest_progress(core_api, name, namespace):
-    """Read the latest progress JSON line from the Job pod's stdout."""
-    latest = None
-    for line in _read_logs(core_api, name, namespace):
-        if line.startswith(PROGRESS_PREFIX):
-            latest = json.loads(line[len(PROGRESS_PREFIX):])
-    return latest
+def _should_await_approval(spec):
+    approval = spec.get("approval") or {}
+    return bool(approval.get("required")) and not bool(approval.get("approved"))
 
 
 @kopf.on.create("verification.inferguard.io/v1alpha1", "inferencechecks")
@@ -140,6 +153,7 @@ def create_check(spec, patch, name, namespace, logger, **_):
     patch.status["phase"] = "Pending"
     patch.status["message"] = "verification job created"
 
+    _ensure_result_cm(name, namespace)
     job = _build_job(
         name, namespace,
         spec.get("suites"),
@@ -149,39 +163,87 @@ def create_check(spec, patch, name, namespace, logger, **_):
     _get_batch_api().create_namespaced_job(namespace=namespace, body=job)
 
 
-@kopf.timer(
-    "verification.inferguard.io/v1alpha1", "inferencechecks",
-    interval=POLL_INTERVAL,
-)
-def watch_job(status, patch, name, namespace, logger, **_):
-    phase = (status or {}).get("phase", "")
-    if phase in ("Verified", "Degraded", "Unknown"):
-        return  # already settled, stop polling
+@kopf.on.event("", "v1", "configmaps", labels=RESULT_CM_LABEL)
+def configmap_changed(event, logger, **_):
+    obj = event.get("object") or {}
+    meta = obj.get("metadata") or {}
+    cm_name = meta.get("name", "")
+    namespace = meta.get("namespace", "")
+    if not cm_name.endswith("-result"):
+        return
+    check_name = cm_name[: -len("-result")]
+    data = obj.get("data") or {}
 
-    batch_api = _get_batch_api()
+    progress_raw = data.get("progress")
+    if progress_raw:
+        try:
+            _patch_status(check_name, namespace, {
+                "progress": json.loads(progress_raw),
+            })
+        except json.JSONDecodeError:
+            logger.warning("invalid progress JSON in %s/%s", namespace, cm_name)
+
+    result_raw = data.get("result")
+    if not result_raw:
+        return
     try:
-        job = batch_api.read_namespaced_job(name=_job_name(name), namespace=namespace)
-    except k8s.ApiException as exc:
-        if exc.status == 404:
-            return  # job not created yet
-        raise
-
-    # Not finished: still running (or waiting for a node). Surface live progress.
-    if job.status.succeeded is None and job.status.failed is None:
-        progress = _read_latest_progress(_get_core_api(), name, namespace)
-        if progress:
-            patch.status["progress"] = progress
+        result = json.loads(result_raw)
+    except json.JSONDecodeError:
+        logger.error("invalid result JSON in %s/%s", namespace, cm_name)
         return
 
-    result = _read_result(_get_core_api(), name, namespace)
-    if result is None:
-        patch.status["phase"] = "Unknown"
-        patch.status["message"] = "job finished but result could not be parsed"
-        return
-
-    # Drop the internal return code before writing back.
     result.pop("returnCode", None)
-    patch.status.update(result)
+
+    # Approval gate: a passing verification may still need human sign-off.
+    if result.get("phase") == "Verified":
+        spec = _read_check_spec(check_name, namespace)
+        if _should_await_approval(spec):
+            result["phase"] = "PendingApproval"
+            result["message"] = "verification passed, awaiting approval"
+
+    _patch_status(check_name, namespace, result)
     logger.info(
-        "InferenceCheck %s/%s settled: %s", namespace, name, result.get("phase")
+        "InferenceCheck %s/%s reflected: %s", namespace, check_name, result.get("phase")
     )
+
+
+def _read_check_spec(name, namespace):
+    try:
+        obj = _get_custom_api().get_namespaced_custom_object(
+            group="verification.inferguard.io",
+            version="v1alpha1",
+            namespace=namespace,
+            plural="inferencechecks",
+            name=name,
+        )
+        return obj.get("spec") or {}
+    except k8s.ApiException:
+        return {}
+
+
+@kopf.on.field(
+    "verification.inferguard.io/v1alpha1", "inferencechecks",
+    field="spec.approval.approved",
+)
+def approval_changed(old, new, name, namespace, logger, **_):
+    if not new:
+        return  # only act when the user approves (true)
+    cm_name = _result_cm_name(name)
+    core_api = _get_core_api()
+    try:
+        cm = core_api.read_namespaced_config_map(cm_name, namespace)
+    except k8s.ApiException:
+        return
+    result_raw = (cm.data or {}).get("result")
+    if not result_raw:
+        return
+    try:
+        result = json.loads(result_raw)
+    except json.JSONDecodeError:
+        return
+
+    result.pop("returnCode", None)
+    result["phase"] = "Verified"
+    result["message"] = "approved"
+    _patch_status(name, namespace, result)
+    logger.info("InferenceCheck %s/%s approved", namespace, name)

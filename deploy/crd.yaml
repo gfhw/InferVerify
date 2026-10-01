@@ -48,6 +48,16 @@ spec:
                   type: object
                   description: Assertion thresholds passed to the suites as variables
                   x-kubernetes-preserve-unknown-fields: true
+                approval:
+                  type: object
+                  description: Human approval gate for passing verifications
+                  properties:
+                    required:
+                      type: boolean
+                      description: If true, a passing verification waits for approval
+                    approved:
+                      type: boolean
+                      description: User sets true to approve
             status:
               type: object
               properties:
